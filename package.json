@@ -1,0 +1,26 @@
+{
+  "name": "@deepgram/bun-voice-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Voice agent proxy using Deepgram's conversational AI API with Bun",
+  "main": "server.ts",
+  "scripts": {
+    "start": "bun run server.ts",
+    "dev": "bun --watch run server.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepgram-starters/bun-voice-agent.git"
+  },
+  "keywords": ["voice-agent", "deepgram", "conversational-ai", "bun", "typescript"],
+  "author": "Deepgram DX Team <devrel@deepgram.com>",
+  "license": "MIT",
+  "dependencies": {
+    "jsonwebtoken": "9.0.2",
+    "@iarna/toml": "2.2.5"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "9.0.9",
+    "@types/bun": "1.2.5"
+  }
+}
