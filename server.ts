@@ -17,6 +17,7 @@
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import TOML from "@iarna/toml";
+import WsClient from "ws";
 
 // ============================================================================
 // ENV LOADING - Bun loads .env files automatically
@@ -231,7 +232,7 @@ function handleHealth(): Response {
  * We store the Deepgram upstream WebSocket on the ws.data property.
  */
 interface WsData {
-  deepgramWs: WebSocket | null;
+  deepgramWs: WsClient | null;
 }
 
 /**
@@ -242,32 +243,30 @@ interface WsData {
 function connectToDeepgram(clientWs: import("bun").ServerWebSocket<WsData>): void {
   console.log("Initiating Deepgram connection...");
 
-  // Connect to Deepgram with API key auth via subprotocol
-  // Deepgram accepts auth via Sec-WebSocket-Protocol header: "token:<api_key>"
-  const deepgramWs = new WebSocket(config.deepgramAgentUrl, [
-    `token:${config.deepgramApiKey}`,
-  ]);
+  // Connect to Deepgram with API key auth via Authorization header
+  // Bun's global WebSocket does not support custom headers, so we use the
+  // `ws` npm package for the upstream connection to Deepgram
+  const deepgramWs = new WsClient(config.deepgramAgentUrl, {
+    headers: {
+      Authorization: `Token ${config.deepgramApiKey}`,
+    },
+  });
 
   // Store reference so close/error handlers can access it
   clientWs.data.deepgramWs = deepgramWs;
 
   // Deepgram connection opened — voice agent sends Welcome message automatically
-  deepgramWs.addEventListener("open", () => {
+  deepgramWs.on("open", () => {
     console.log("Connected to Deepgram Agent API");
   });
 
   // Forward all messages from Deepgram to client
-  deepgramWs.addEventListener("message", (event: MessageEvent) => {
+  deepgramWs.on("message", (data: Buffer, isBinary: boolean) => {
     try {
-      if (event.data instanceof ArrayBuffer) {
-        clientWs.sendBinary(new Uint8Array(event.data));
-      } else if (event.data instanceof Blob) {
-        // Convert Blob to ArrayBuffer then forward as binary
-        event.data.arrayBuffer().then((buf) => {
-          clientWs.sendBinary(new Uint8Array(buf));
-        });
+      if (isBinary) {
+        clientWs.sendBinary(new Uint8Array(data));
       } else {
-        clientWs.sendText(String(event.data));
+        clientWs.sendText(data.toString());
       }
     } catch {
       // Client may have disconnected — ignore send errors
@@ -275,13 +274,13 @@ function connectToDeepgram(clientWs: import("bun").ServerWebSocket<WsData>): voi
   });
 
   // Handle Deepgram connection errors
-  deepgramWs.addEventListener("error", (event: Event) => {
-    console.error("Deepgram WebSocket error:", event);
+  deepgramWs.on("error", (error: Error) => {
+    console.error("Deepgram WebSocket error:", error);
     try {
       clientWs.sendText(
         JSON.stringify({
           type: "Error",
-          description: "Deepgram connection error",
+          description: error.message || "Deepgram connection error",
           code: "PROVIDER_ERROR",
         })
       );
@@ -291,11 +290,12 @@ function connectToDeepgram(clientWs: import("bun").ServerWebSocket<WsData>): voi
   });
 
   // Handle Deepgram disconnect — close client with safe code
-  deepgramWs.addEventListener("close", (event: CloseEvent) => {
-    console.log(`Deepgram connection closed: ${event.code} ${event.reason}`);
-    const closeCode = getSafeCloseCode(event.code);
+  deepgramWs.on("close", (code: number, reason: Buffer) => {
+    const reasonStr = reason.toString();
+    console.log(`Deepgram connection closed: ${code} ${reasonStr}`);
+    const closeCode = getSafeCloseCode(code);
     try {
-      clientWs.close(closeCode, event.reason || undefined);
+      clientWs.close(closeCode, reasonStr || undefined);
     } catch {
       // Client may already be closed
     }
@@ -403,7 +403,7 @@ Bun.serve({
      */
     message(ws: import("bun").ServerWebSocket<WsData>, message: string | Buffer) {
       const deepgramWs = ws.data.deepgramWs;
-      if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+      if (deepgramWs && deepgramWs.readyState === WsClient.OPEN) {
         deepgramWs.send(message);
       }
     },
@@ -414,8 +414,8 @@ Bun.serve({
      */
     close(ws: import("bun").ServerWebSocket<WsData>, code: number, reason: string) {
       console.log(`Client disconnected: ${code} ${reason}`);
-      const deepgramWs = ws.data.deepgramWs;
-      if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+      const deepgramWs = ws.data?.deepgramWs;
+      if (deepgramWs && deepgramWs.readyState === WsClient.OPEN) {
         deepgramWs.close();
       }
       activeConnections.delete(ws as unknown as WebSocket);
@@ -427,8 +427,8 @@ Bun.serve({
      */
     error(ws: import("bun").ServerWebSocket<WsData>, error: Error) {
       console.error("Client WebSocket error:", error);
-      const deepgramWs = ws.data.deepgramWs;
-      if (deepgramWs && deepgramWs.readyState === WebSocket.OPEN) {
+      const deepgramWs = ws.data?.deepgramWs;
+      if (deepgramWs && deepgramWs.readyState === WsClient.OPEN) {
         deepgramWs.close();
       }
     },
