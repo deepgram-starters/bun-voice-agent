@@ -367,6 +367,12 @@ async function connectToDeepgram(
         clientWs.sendBinary(new Uint8Array(data));
       } else if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
         clientWs.sendBinary(new Uint8Array(data as Uint8Array));
+      } else if (data instanceof Blob) {
+        // SDK delivers agent audio as a Blob; JSON.stringify(Blob) is "{}",
+        // so unwrap to bytes before forwarding.
+        data.arrayBuffer().then((buf) => {
+          try { clientWs.sendBinary(new Uint8Array(buf)); } catch {}
+        });
       } else {
         clientWs.sendText(JSON.stringify(data));
       }
