@@ -16,7 +16,7 @@
   "author": "Deepgram DX Team <devrel@deepgram.com>",
   "license": "MIT",
   "dependencies": {
-    "@deepgram/sdk": "^5.7.0",
+    "@deepgram/sdk": "^5.9.0",
     "@iarna/toml": "2.2.5",
     "jsonwebtoken": "9.0.2"
   },
