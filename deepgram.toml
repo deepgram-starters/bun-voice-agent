@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/bun-voice-agent"
 useCase = "voice-agent"
 language = "typescript"
 framework = "bun"
-sdk = "N/A"
+sdk = "@deepgram/sdk"
 tags = ["voice-agent", "conversational-ai", "voice-ai", "voice-bot", "typescript", "bun"]
 
 [check]

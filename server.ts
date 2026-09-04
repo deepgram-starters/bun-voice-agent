@@ -17,7 +17,7 @@
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import TOML from "@iarna/toml";
-import WsClient from "ws";
+import { DeepgramClient } from "@deepgram/sdk";
 
 // ============================================================================
 // ENV LOADING - Bun loads .env files automatically
@@ -37,15 +37,45 @@ interface ServerConfig {
   port: number;
   host: string;
   deepgramApiKey: string;
-  deepgramAgentUrl: string;
 }
 
 const config: ServerConfig = {
   port: parseInt(process.env.PORT || "8081"),
   host: process.env.HOST || "0.0.0.0",
   deepgramApiKey: loadApiKey(),
-  deepgramAgentUrl: "wss://agent.deepgram.com/v1/agent/converse",
 };
+
+// ============================================================================
+// DEEPGRAM SDK CLIENT
+// ============================================================================
+
+// A single SDK client is reused across connections; the API key is resolved
+// here so the browser never sees it. The Voice Agent websocket is managed by
+// the SDK (auth, framing, reconnection) via `deepgram.agent.v1`.
+//
+// DEEPGRAM_BASE_URL (e.g. a staging host like wss://agent.staging.deepgram.com)
+// overrides the default agent endpoint.
+const baseUrl = process.env.DEEPGRAM_BASE_URL;
+const deepgram = new DeepgramClient({
+  apiKey: config.deepgramApiKey,
+  ...(baseUrl
+    ? {
+        environment: {
+          base: baseUrl
+            .replace(/^wss:\/\//, "https://")
+            .replace(/^ws:\/\//, "http://"),
+          production: baseUrl,
+          agent: baseUrl,
+          agentRest: baseUrl
+            .replace(/^wss:\/\//, "https://")
+            .replace(/^ws:\/\//, "http://"),
+        },
+      }
+    : {}),
+});
+if (baseUrl) {
+  console.log(`Using custom Deepgram base URL: ${baseUrl}`);
+}
 
 // ============================================================================
 // SESSION AUTH - JWT tokens for production security
@@ -138,6 +168,8 @@ function getCorsHeaders(): Record<string, string> {
 
 /** Reserved WebSocket close codes that cannot be set by applications */
 const RESERVED_CLOSE_CODES = [1004, 1005, 1006, 1015];
+const MAX_PENDING_MESSAGES = 128;
+const MAX_PENDING_BYTES = 512 * 1024;
 
 /**
  * Returns a safe WebSocket close code, translating reserved codes to 1000.
@@ -232,55 +264,163 @@ function handleHealth(): Response {
  * We store the Deepgram upstream WebSocket on the ws.data property.
  */
 interface WsData {
-  deepgramWs: WsClient | null;
+  // The SDK Voice Agent connection (agent.v1 socket) for this client.
+  dgConn: any;
+  // Whether the Deepgram socket is open and ready to receive media/control.
+  dgReady: boolean;
+  // Browser messages received before Deepgram is ready, flushed on open.
+  pending: Array<{ binary: true; data: Uint8Array } | { binary: false; msg: any }>;
+  pendingBytes: number;
+  pendingOverflowed: boolean;
+}
+
+function queuePending(
+  ws: import("bun").ServerWebSocket<WsData>,
+  item: WsData["pending"][number],
+  bytes: number
+): boolean {
+  if (ws.data.pendingOverflowed) return false;
+  if (
+    ws.data.pending.length >= MAX_PENDING_MESSAGES ||
+    ws.data.pendingBytes + bytes > MAX_PENDING_BYTES
+  ) {
+    ws.data.pending = [];
+    ws.data.pendingBytes = 0;
+    ws.data.pendingOverflowed = true;
+    ws.close(1009, "Deepgram connection is not ready");
+    return false;
+  }
+  ws.data.pending.push(item);
+  ws.data.pendingBytes += bytes;
+  return true;
 }
 
 /**
- * Establishes a WebSocket connection to Deepgram Voice Agent API
- * and sets up bidirectional message forwarding.
+ * Route a JSON control message from the browser to the matching agent.v1
+ * method on the Deepgram connection. The browser protocol is unchanged: the
+ * client sends its Settings first, then optional Update / Inject / KeepAlive
+ * messages, exactly as before.
+ */
+function dispatchAgentControl(dgConn: any, msg: any): void {
+  try {
+    switch (msg?.type) {
+      case "Settings":
+        dgConn.sendSettings(msg);
+        break;
+      case "KeepAlive":
+        dgConn.sendKeepAlive({ type: "KeepAlive" });
+        break;
+      case "UpdateSpeak":
+        dgConn.sendUpdateSpeak(msg);
+        break;
+      case "UpdatePrompt":
+        dgConn.sendUpdatePrompt(msg);
+        break;
+      case "UpdateListen":
+        dgConn.sendUpdateListen(msg);
+        break;
+      case "UpdateThink":
+        dgConn.sendUpdateThink(msg);
+        break;
+      case "InjectUserMessage":
+        dgConn.sendInjectUserMessage(msg);
+        break;
+      case "InjectAgentMessage":
+        dgConn.sendInjectAgentMessage(msg);
+        break;
+      case "FunctionCallResponse":
+        dgConn.sendFunctionCallResponse(msg);
+        break;
+      default:
+        console.warn("Ignoring unknown client control message type:", msg?.type);
+    }
+  } catch (error) {
+    console.error("Failed to forward control message to Deepgram:", error);
+  }
+}
+
+/**
+ * Establishes a connection to the Deepgram Voice Agent API via the SDK and
+ * sets up bidirectional message forwarding. The SDK manages the upstream
+ * websocket, auth, and framing; the browser-facing protocol is unchanged.
  * @param clientWs - The Bun server-side WebSocket for the connected client
  */
-function connectToDeepgram(clientWs: import("bun").ServerWebSocket<WsData>): void {
+async function connectToDeepgram(
+  clientWs: import("bun").ServerWebSocket<WsData>
+): Promise<void> {
   console.log("Initiating Deepgram connection...");
 
-  // Connect to Deepgram with API key auth via Authorization header
-  // Bun's global WebSocket does not support custom headers, so we use the
-  // `ws` npm package for the upstream connection to Deepgram
-  const deepgramWs = new WsClient(config.deepgramAgentUrl, {
-    headers: {
-      Authorization: `Token ${config.deepgramApiKey}`,
-    },
-  });
-
-  // Store reference so close/error handlers can access it
-  clientWs.data.deepgramWs = deepgramWs;
-
-  // Deepgram connection opened — voice agent sends Welcome message automatically
-  deepgramWs.on("open", () => {
-    console.log("Connected to Deepgram Agent API");
-  });
-
-  // Forward all messages from Deepgram to client
-  deepgramWs.on("message", (data: Buffer, isBinary: boolean) => {
-    try {
-      if (isBinary) {
-        clientWs.sendBinary(new Uint8Array(data));
-      } else {
-        clientWs.sendText(data.toString());
-      }
-    } catch {
-      // Client may have disconnected — ignore send errors
-    }
-  });
-
-  // Handle Deepgram connection errors
-  deepgramWs.on("error", (error: Error) => {
-    console.error("Deepgram WebSocket error:", error);
+  // Create the agent connection object (not yet connected). Auth is resolved
+  // from the API key by the SDK client.
+  let dgConn: any;
+  try {
+    dgConn = await deepgram.agent.v1.createConnection();
+  } catch (error) {
+    console.error("Failed to create Deepgram Agent connection:", error);
     try {
       clientWs.sendText(
         JSON.stringify({
           type: "Error",
-          description: error.message || "Deepgram connection error",
+          description:
+            error instanceof Error ? error.message : "Failed to reach Deepgram",
+          code: "PROVIDER_ERROR",
+        })
+      );
+      clientWs.close(getSafeCloseCode(1011));
+    } catch {
+      // Client may already be closed
+    }
+    activeConnections.delete(clientWs as unknown as WebSocket);
+    return;
+  }
+  clientWs.data.dgConn = dgConn;
+
+  // Deepgram connection opened — voice agent sends Welcome message automatically
+  dgConn.on("open", () => {
+    console.log("Connected to Deepgram Agent API");
+  });
+
+  // Blob conversion is asynchronous, so serialize every frame to retain the
+  // upstream order between final audio and AgentAudioDone.
+  async function forwardToClient(data: unknown) {
+    try {
+      if (clientWs.readyState !== WebSocket.OPEN) return;
+      if (typeof data === "string") {
+        clientWs.sendText(data);
+      } else if (data instanceof ArrayBuffer) {
+        clientWs.sendBinary(new Uint8Array(data));
+      } else if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
+        clientWs.sendBinary(new Uint8Array(data as Uint8Array));
+      } else if (data instanceof Blob) {
+        // SDK delivers agent audio as a Blob; JSON.stringify(Blob) is "{}",
+        // so unwrap to bytes before forwarding.
+        const buffer = await data.arrayBuffer();
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.sendBinary(new Uint8Array(buffer));
+        }
+      } else {
+        clientWs.sendText(JSON.stringify(data));
+      }
+    } catch {
+      // Client may have disconnected — ignore send errors
+    }
+  }
+
+  let sendChain = Promise.resolve();
+  dgConn.on("message", (data: unknown) => {
+    sendChain = sendChain
+      .then(() => forwardToClient(data))
+      .catch((error) => console.error("Failed to forward Deepgram message:", error));
+  });
+
+  // Handle Deepgram connection errors
+  dgConn.on("error", (error: any) => {
+    console.error("Deepgram socket error:", error);
+    try {
+      clientWs.sendText(
+        JSON.stringify({
+          type: "Error",
+          description: error?.message || "Deepgram connection error",
           code: "PROVIDER_ERROR",
         })
       );
@@ -289,18 +429,46 @@ function connectToDeepgram(clientWs: import("bun").ServerWebSocket<WsData>): voi
     }
   });
 
-  // Handle Deepgram disconnect — close client with safe code
-  deepgramWs.on("close", (code: number, reason: Buffer) => {
-    const reasonStr = reason.toString();
-    console.log(`Deepgram connection closed: ${code} ${reasonStr}`);
-    const closeCode = getSafeCloseCode(code);
+  // Handle Deepgram disconnect — close client with a safe code
+  dgConn.on("close", (event: { code?: number; reason?: string }) => {
+    console.log(`Deepgram connection closed: ${event?.code ?? 1000} ${event?.reason ?? ""}`);
     try {
-      clientWs.close(closeCode, reasonStr || undefined);
+      clientWs.close(getSafeCloseCode(event?.code), event?.reason || undefined);
     } catch {
       // Client may already be closed
     }
     activeConnections.delete(clientWs as unknown as WebSocket);
   });
+
+  // Open the connection, then flush anything the browser queued early (the
+  // client typically sends its Settings message immediately).
+  try {
+    dgConn.connect();
+    await dgConn.waitForOpen();
+    clientWs.data.dgReady = true;
+    for (const item of clientWs.data.pending) {
+      if (item.binary) {
+        try {
+          dgConn.sendMedia(item.data);
+        } catch (error) {
+          console.error("Failed to send buffered audio to Deepgram:", error);
+        }
+      } else {
+        dispatchAgentControl(dgConn, item.msg);
+      }
+    }
+    clientWs.data.pending = [];
+    clientWs.data.pendingBytes = 0;
+  } catch (error) {
+    console.error("Deepgram connection did not open:", error);
+    clientWs.data.pending = [];
+    clientWs.data.pendingBytes = 0;
+    try {
+      clientWs.close(getSafeCloseCode(1011));
+    } catch {
+      // Client may already be closed
+    }
+  }
 }
 
 // ============================================================================
@@ -346,7 +514,7 @@ Bun.serve({
 
       // Upgrade the HTTP request to a WebSocket connection
       const success = server.upgrade<WsData>(req, {
-        data: { deepgramWs: null },
+        data: { dgConn: null, dgReady: false, pending: [], pendingBytes: 0, pendingOverflowed: false },
         headers: {
           "Sec-WebSocket-Protocol": validProto,
         },
@@ -394,18 +562,48 @@ Bun.serve({
     open(ws: import("bun").ServerWebSocket<WsData>) {
       console.log("Client connected to /api/voice-agent");
       activeConnections.add(ws as unknown as WebSocket);
-      connectToDeepgram(ws);
+      // Fire-and-forget: connectToDeepgram opens the SDK socket and buffers any
+      // early browser messages until it is ready.
+      void connectToDeepgram(ws);
     },
 
     /**
      * Called when a message is received from the client.
-     * Forwards all messages (binary audio + JSON control) to Deepgram.
+     * Binary frames are mic audio; text frames are JSON control messages
+     * (Settings / KeepAlive / Update* / Inject* / ...). Everything is forwarded
+     * to Deepgram via the SDK, buffered until the socket is ready.
      */
     message(ws: import("bun").ServerWebSocket<WsData>, message: string | Buffer) {
-      const deepgramWs = ws.data.deepgramWs;
-      if (deepgramWs && deepgramWs.readyState === WsClient.OPEN) {
-        deepgramWs.send(message);
+      const dgConn = ws.data.dgConn;
+
+      // Binary audio frame.
+        if (typeof message !== "string") {
+          const bytes = new Uint8Array(message);
+          if (!ws.data.dgReady || !dgConn) {
+            queuePending(ws, { binary: true, data: bytes }, bytes.byteLength);
+            return;
+        }
+        try {
+          dgConn.sendMedia(bytes);
+        } catch (error) {
+          console.error("Failed to send audio to Deepgram:", error);
+        }
+        return;
       }
+
+      // Text frame — a JSON control message.
+      let msg: any;
+      try {
+        msg = JSON.parse(message);
+      } catch {
+        console.warn("Ignoring non-JSON text message from client");
+        return;
+      }
+      if (!ws.data.dgReady || !dgConn) {
+        queuePending(ws, { binary: false, msg }, new TextEncoder().encode(message).byteLength);
+        return;
+      }
+      dispatchAgentControl(dgConn, msg);
     },
 
     /**
@@ -414,10 +612,13 @@ Bun.serve({
      */
     close(ws: import("bun").ServerWebSocket<WsData>, code: number, reason: string) {
       console.log(`Client disconnected: ${code} ${reason}`);
-      const deepgramWs = ws.data?.deepgramWs;
-      if (deepgramWs && deepgramWs.readyState === WsClient.OPEN) {
-        deepgramWs.close();
+      try {
+        ws.data?.dgConn?.close();
+      } catch {
+        // already closed
       }
+      ws.data.pending = [];
+      ws.data.pendingBytes = 0;
       activeConnections.delete(ws as unknown as WebSocket);
     },
 
@@ -427,9 +628,10 @@ Bun.serve({
      */
     error(ws: import("bun").ServerWebSocket<WsData>, error: Error) {
       console.error("Client WebSocket error:", error);
-      const deepgramWs = ws.data?.deepgramWs;
-      if (deepgramWs && deepgramWs.readyState === WsClient.OPEN) {
-        deepgramWs.close();
+      try {
+        ws.data?.dgConn?.close();
+      } catch {
+        // already closed
       }
     },
   },
