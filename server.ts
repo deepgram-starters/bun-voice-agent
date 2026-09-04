@@ -168,6 +168,8 @@ function getCorsHeaders(): Record<string, string> {
 
 /** Reserved WebSocket close codes that cannot be set by applications */
 const RESERVED_CLOSE_CODES = [1004, 1005, 1006, 1015];
+const MAX_PENDING_MESSAGES = 128;
+const MAX_PENDING_BYTES = 512 * 1024;
 
 /**
  * Returns a safe WebSocket close code, translating reserved codes to 1000.
@@ -268,6 +270,29 @@ interface WsData {
   dgReady: boolean;
   // Browser messages received before Deepgram is ready, flushed on open.
   pending: Array<{ binary: true; data: Uint8Array } | { binary: false; msg: any }>;
+  pendingBytes: number;
+  pendingOverflowed: boolean;
+}
+
+function queuePending(
+  ws: import("bun").ServerWebSocket<WsData>,
+  item: WsData["pending"][number],
+  bytes: number
+): boolean {
+  if (ws.data.pendingOverflowed) return false;
+  if (
+    ws.data.pending.length >= MAX_PENDING_MESSAGES ||
+    ws.data.pendingBytes + bytes > MAX_PENDING_BYTES
+  ) {
+    ws.data.pending = [];
+    ws.data.pendingBytes = 0;
+    ws.data.pendingOverflowed = true;
+    ws.close(1009, "Deepgram connection is not ready");
+    return false;
+  }
+  ws.data.pending.push(item);
+  ws.data.pendingBytes += bytes;
+  return true;
 }
 
 /**
@@ -433,8 +458,11 @@ async function connectToDeepgram(
       }
     }
     clientWs.data.pending = [];
+    clientWs.data.pendingBytes = 0;
   } catch (error) {
     console.error("Deepgram connection did not open:", error);
+    clientWs.data.pending = [];
+    clientWs.data.pendingBytes = 0;
     try {
       clientWs.close(getSafeCloseCode(1011));
     } catch {
@@ -486,7 +514,7 @@ Bun.serve({
 
       // Upgrade the HTTP request to a WebSocket connection
       const success = server.upgrade<WsData>(req, {
-        data: { dgConn: null, dgReady: false, pending: [] },
+        data: { dgConn: null, dgReady: false, pending: [], pendingBytes: 0, pendingOverflowed: false },
         headers: {
           "Sec-WebSocket-Protocol": validProto,
         },
@@ -549,11 +577,11 @@ Bun.serve({
       const dgConn = ws.data.dgConn;
 
       // Binary audio frame.
-      if (typeof message !== "string") {
-        const bytes = new Uint8Array(message);
-        if (!ws.data.dgReady || !dgConn) {
-          ws.data.pending.push({ binary: true, data: bytes });
-          return;
+        if (typeof message !== "string") {
+          const bytes = new Uint8Array(message);
+          if (!ws.data.dgReady || !dgConn) {
+            queuePending(ws, { binary: true, data: bytes }, bytes.byteLength);
+            return;
         }
         try {
           dgConn.sendMedia(bytes);
@@ -572,7 +600,7 @@ Bun.serve({
         return;
       }
       if (!ws.data.dgReady || !dgConn) {
-        ws.data.pending.push({ binary: false, msg });
+        queuePending(ws, { binary: false, msg }, new TextEncoder().encode(message).byteLength);
         return;
       }
       dispatchAgentControl(dgConn, msg);
@@ -589,6 +617,8 @@ Bun.serve({
       } catch {
         // already closed
       }
+      ws.data.pending = [];
+      ws.data.pendingBytes = 0;
       activeConnections.delete(ws as unknown as WebSocket);
     },
 
