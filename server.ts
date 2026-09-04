@@ -355,12 +355,11 @@ async function connectToDeepgram(
     console.log("Connected to Deepgram Agent API");
   });
 
-  // Forward all messages from Deepgram to the client. Agent audio arrives as
-  // binary (ArrayBuffer/Blob/Buffer); JSON events (Welcome / ConversationText /
-  // ...) arrive as parsed objects. Preserve the exact frame types the browser
-  // previously received.
-  dgConn.on("message", (data: unknown) => {
+  // Blob conversion is asynchronous, so serialize every frame to retain the
+  // upstream order between final audio and AgentAudioDone.
+  async function forwardToClient(data: unknown) {
     try {
+      if (clientWs.readyState !== WebSocket.OPEN) return;
       if (typeof data === "string") {
         clientWs.sendText(data);
       } else if (data instanceof ArrayBuffer) {
@@ -370,15 +369,23 @@ async function connectToDeepgram(
       } else if (data instanceof Blob) {
         // SDK delivers agent audio as a Blob; JSON.stringify(Blob) is "{}",
         // so unwrap to bytes before forwarding.
-        data.arrayBuffer().then((buf) => {
-          try { clientWs.sendBinary(new Uint8Array(buf)); } catch {}
-        });
+        const buffer = await data.arrayBuffer();
+        if (clientWs.readyState === WebSocket.OPEN) {
+          clientWs.sendBinary(new Uint8Array(buffer));
+        }
       } else {
         clientWs.sendText(JSON.stringify(data));
       }
     } catch {
       // Client may have disconnected — ignore send errors
     }
+  }
+
+  let sendChain = Promise.resolve();
+  dgConn.on("message", (data: unknown) => {
+    sendChain = sendChain
+      .then(() => forwardToClient(data))
+      .catch((error) => console.error("Failed to forward Deepgram message:", error));
   });
 
   // Handle Deepgram connection errors
@@ -398,10 +405,10 @@ async function connectToDeepgram(
   });
 
   // Handle Deepgram disconnect — close client with a safe code
-  dgConn.on("close", () => {
-    console.log("Deepgram connection closed");
+  dgConn.on("close", (event: { code?: number; reason?: string }) => {
+    console.log(`Deepgram connection closed: ${event?.code ?? 1000} ${event?.reason ?? ""}`);
     try {
-      clientWs.close(getSafeCloseCode(1000));
+      clientWs.close(getSafeCloseCode(event?.code), event?.reason || undefined);
     } catch {
       // Client may already be closed
     }
